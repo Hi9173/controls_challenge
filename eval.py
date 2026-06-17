@@ -16,6 +16,7 @@ from tinyphysics import CONTROL_START_IDX, get_available_controllers, run_rollou
 
 sns.set_theme()
 SAMPLE_ROLLOUTS = 5
+DEFAULT_MAX_WORKERS = 16
 
 COLORS = {
   'test': '#c0392b',
@@ -98,12 +99,25 @@ def create_report(test, baseline, sample_rollouts, costs, num_segs):
     print("Report saved to: './report.html'")
 
 
+def run_batch_rollouts(files, controller_type, model_path, max_workers):
+  rollout_partial = partial(run_rollout, controller_type=controller_type, model_path=model_path, debug=False)
+  if max_workers <= 1:
+    return [rollout_partial(f) for f in tqdm(files)]
+
+  try:
+    return process_map(rollout_partial, files, max_workers=max_workers, chunksize=10)
+  except PermissionError as e:
+    print(f"Multiprocessing unavailable ({e}); falling back to serial rollouts.")
+    return [rollout_partial(f) for f in tqdm(files)]
+
+
 if __name__ == "__main__":
   available_controllers = get_available_controllers()
   parser = argparse.ArgumentParser()
   parser.add_argument("--model_path", type=str, required=True)
   parser.add_argument("--data_path", type=str, required=True)
   parser.add_argument("--num_segs", type=int, default=100)
+  parser.add_argument("--max_workers", type=int, default=DEFAULT_MAX_WORKERS)
   parser.add_argument("--test_controller", default='pid', choices=available_controllers)
   parser.add_argument("--baseline_controller", default='pid', choices=available_controllers)
   args = parser.parse_args()
@@ -113,7 +127,9 @@ if __name__ == "__main__":
 
   costs = []
   sample_rollouts = []
-  files = sorted(data_path.iterdir())[:args.num_segs]
+  files = sorted(data_path.glob("*.csv"))[:args.num_segs]
+  if not files:
+    raise FileNotFoundError(f"No CSV segments found in {data_path}")
   print("Running rollouts for visualizations...")
   for d, data_file in enumerate(tqdm(files[:SAMPLE_ROLLOUTS], total=SAMPLE_ROLLOUTS)):
     test_cost, test_target_lataccel, test_current_lataccel = run_rollout(data_file, args.test_controller, args.model_path, debug=False)
@@ -132,8 +148,7 @@ if __name__ == "__main__":
 
   for controller_cat, controller_type in [('baseline', args.baseline_controller), ('test', args.test_controller)]:
     print(f"Running batch rollouts => {controller_cat} controller: {controller_type}")
-    rollout_partial = partial(run_rollout, controller_type=controller_type, model_path=args.model_path, debug=False)
-    results = process_map(rollout_partial, files[SAMPLE_ROLLOUTS:], max_workers=16, chunksize=10)
+    results = run_batch_rollouts(files[SAMPLE_ROLLOUTS:], controller_type, args.model_path, args.max_workers)
     costs += [{'controller': controller_cat, **result[0]} for result in results]
 
   create_report(args.test_controller, args.baseline_controller, sample_rollouts, costs, len(files))

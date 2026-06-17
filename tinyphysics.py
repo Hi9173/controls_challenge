@@ -16,6 +16,7 @@ from functools import partial
 from hashlib import md5
 from pathlib import Path
 from typing import List, Union, Tuple, Dict
+from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
 
 from controllers import BaseController
@@ -42,6 +43,7 @@ FuturePlan = namedtuple('FuturePlan', ['lataccel', 'roll_lataccel', 'v_ego', 'a_
 
 DATASET_URL = "https://huggingface.co/datasets/commaai/commaSteeringControl/resolve/main/data/SYNTHETIC_V0.zip"
 DATASET_PATH = Path(__file__).resolve().parent / "data"
+DEFAULT_MAX_WORKERS = 16
 
 class LataccelTokenizer:
   def __init__(self):
@@ -232,17 +234,35 @@ def download_dataset():
             dest.write(src.read())
 
 
+def dataset_exists() -> bool:
+  return DATASET_PATH.exists() and any(DATASET_PATH.glob("*.csv"))
+
+
+def run_rollouts(files, controller_type, model_path, debug=False, max_workers=DEFAULT_MAX_WORKERS):
+  run_rollout_partial = partial(run_rollout, controller_type=controller_type, model_path=model_path, debug=debug)
+  if max_workers <= 1:
+    return [run_rollout_partial(f) for f in tqdm(files)]
+
+  try:
+    return process_map(run_rollout_partial, files, max_workers=max_workers, chunksize=10)
+  except PermissionError as e:
+    print(f"Multiprocessing unavailable ({e}); falling back to serial rollouts.")
+    return [run_rollout_partial(f) for f in tqdm(files)]
+
+
 if __name__ == "__main__":
   available_controllers = get_available_controllers()
   parser = argparse.ArgumentParser()
   parser.add_argument("--model_path", type=str, required=True)
   parser.add_argument("--data_path", type=str, required=True)
   parser.add_argument("--num_segs", type=int, default=100)
+  parser.add_argument("--max_workers", type=int, default=DEFAULT_MAX_WORKERS)
+  parser.add_argument("--plot", action='store_true')
   parser.add_argument("--debug", action='store_true')
   parser.add_argument("--controller", default='pid', choices=available_controllers)
   args = parser.parse_args()
 
-  if not DATASET_PATH.exists():
+  if not dataset_exists():
     download_dataset()
 
   data_path = Path(args.data_path)
@@ -250,16 +270,18 @@ if __name__ == "__main__":
     cost, _, _ = run_rollout(data_path, args.controller, args.model_path, debug=args.debug)
     print(f"\nAverage lataccel_cost: {cost['lataccel_cost']:>6.4}, average jerk_cost: {cost['jerk_cost']:>6.4}, average total_cost: {cost['total_cost']:>6.4}")
   elif data_path.is_dir():
-    run_rollout_partial = partial(run_rollout, controller_type=args.controller, model_path=args.model_path, debug=False)
-    files = sorted(data_path.iterdir())[:args.num_segs]
-    results = process_map(run_rollout_partial, files, max_workers=16, chunksize=10)
+    files = sorted(data_path.glob("*.csv"))[:args.num_segs]
+    if not files:
+      raise FileNotFoundError(f"No CSV segments found in {data_path}")
+    results = run_rollouts(files, args.controller, args.model_path, debug=False, max_workers=args.max_workers)
     costs = [result[0] for result in results]
     costs_df = pd.DataFrame(costs)
     print(f"\nAverage lataccel_cost: {np.mean(costs_df['lataccel_cost']):>6.4}, average jerk_cost: {np.mean(costs_df['jerk_cost']):>6.4}, average total_cost: {np.mean(costs_df['total_cost']):>6.4}")
-    for cost in costs_df.columns:
-      plt.hist(costs_df[cost], bins=np.arange(0, 1000, 10), label=cost, alpha=0.5)
-    plt.xlabel('costs')
-    plt.ylabel('Frequency')
-    plt.title('costs Distribution')
-    plt.legend()
-    plt.show()
+    if args.plot:
+      for cost in costs_df.columns:
+        plt.hist(costs_df[cost], bins=np.arange(0, 1000, 10), label=cost, alpha=0.5)
+      plt.xlabel('costs')
+      plt.ylabel('Frequency')
+      plt.title('costs Distribution')
+      plt.legend()
+      plt.show()
